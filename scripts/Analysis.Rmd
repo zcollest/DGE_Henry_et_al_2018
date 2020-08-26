@@ -1,0 +1,773 @@
+---
+title: "Differential Gene Expression Analysis with respect to Noncanonical NF-kB Signaling Pathways"
+author: 
+- name: "Zach Collester"
+  affiliation: Universitat Pompeu Fabra
+  email: zacharyr.collester01@estudiant.upf.edu
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    fig_captions: yes
+bibliography: bibliography.bib
+---
+
+```{r setup, echo=FALSE, cache=FALSE}
+library(knitr) ## kable()
+library(kableExtra) ## kable_styling(), save_kable()
+library(usethis) ## use_directory(), proj_path()
+
+knitr::opts_chunk$set(
+  collapse=TRUE,
+  comment="",
+  fig.align="center",
+  cache=FALSE
+)
+
+## this option avoid use_directory() being verbose later on
+options(usethis.quiet=TRUE)
+```
+
+# Introduction
+
+Multiple previous studies have shown that members of the family of nuclear factor kB (NF-kB) transcription factors can play very important roles in mulitple cellular processes (immune response, cell proliferation, cell survival, etc.). Activation of canonical NF-kB signaling pathways are fairly well studied, but there is a lack of information regarding the activation of noncanonical NF-kB signaling pathways. Using high-content phenotypic screening, @Henryeaam8216 were able to identify cyclin-dependent kinase 12 (CDK12) as a regulator of this pathway. Further, chemoproteomics identified the chemical compound 919278 which targets CDK12, specifically functioning as an inhibitor of CDK12. To better understand global trancsriptional changes, the authors sequenced the transcriptome of a human osteosarcoma cell line (U2OS) and treated the cells in a range of different experimental conditions (stimulation (TWEAK or unstimulated), time of treatment/stimulation (24hr or 4hr), and treatments (BIO0919278, BIO0702697, BIO032202, DMSO, NTsiRNA, siRNAs523626, siRNAs523629)). 
+
+It is important to note that BIO0702697 is the S-enantiomer of BIO0919278. Using high-throughput screening techniques, the authors found that BIO0702697 was significantly less potent of a compound relative to BIO0919278 relative to activating the noncanonical NF-kB signaling pathway. The main goal of the differential expression analysis in this data analysis is to analyze differential gene expression between the two enantiomer treatments (BIO0702697 and BIO0919278). This type of analysis would help us determine the extent to which stereochemistry of these molecules affects pathways related to noncanonical NF-kB signaling. It will ideally help us validate and provide further evidence for the results in the original paper.  
+
+The resulting raw RNA-seq data have been deposited at the Gene Expression Omnibus (GEO), where they are publicly available under accession [GSE113926](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE113926). Here, we show a first exploratory analysis of the corresponding RNA-seq gene expression profiles generated as a table of counts using the DEE2 (http://dee2.io) pipeline by @ziemann19, and further packaged
+into a [SummarizedExperiment](https://bioconductor.org/SummarizedExperiment) object with genes mapped to Entrez identifiers. This object also stores the phenotypic information about the profiled samples that has been also made available at GEO.
+
+# Quality Assessment
+
+## Data Import and Cleaning
+
+We start importing the raw table of counts.
+
+```{r, message=FALSE}
+library(SummarizedExperiment)
+
+se <- readRDS(usethis::proj_path(file.path("data", "data.rds")))
+se
+```
+
+We have 25122 genes by 44 samples. From the first row and column names shown by the object, we can figure out that genes are defined by [Entrez](https://www.ncbi.nlm.nih.gov/gene) [@maglott10] identifiers and samples by Sequence Read Archive Run ([SRR] (https://www.ncbi.nlm.nih.gov/books/NBK56913/#search.what_do_the_different_sra_accessi)) identifiers.
+
+The row data in this object contains information about the profiled genes.
+
+```{r}
+head(rowData(se))
+```
+Among this information, the gene symbol and description are potentially useful for interpreting results of, for instance, a differential expression analysis. Let's explore now the column (phenotypic) data.
+
+```{r}
+dim(colData(se))
+head(colData(se), n=3)
+```
+
+We have a total of 44 phenotypic variables. The second column `geo_accession` contains GEO Sample Accession Number
+([GSM](https://www.ncbi.nlm.nih.gov/geo/info/overview.html)) identifers. GSM identifiers define individual samples, understood in this context as individual sources of RNA. If the GSM identifiers are repeated, this indicates that among the 44 samples there are technical replicates. We can figure out how many technical replicates per GSM sample we have as follows:
+
+```{r}
+length(unique(se$geo_accession))
+table(lengths(split(colnames(se), se$geo_accession)))
+```
+
+This has shown us that there are no technical replicates among the 44 samples (all GSM identifiers are unique).
+
+To proceed further exploring this dataset, we are going to use the [edgeR](https://bioconductor.org/packages/edgeR) package and build a `DGEList` object, incorporating the gene metadata, which includes the gene symbol.
+
+```{r, message=FALSE}
+library(edgeR)
+
+dge <- DGEList(counts=assays(se)$counts, genes=rowData(se))
+dim(dge)
+```
+
+We will now calculate the $\log_2$ CPM units of expression and put them as an additional assay element to ease their manipulation. CPM is a form of within-sample scaling using counts per million reads (CPM) mapped to the genome. 
+
+```{r}
+assays(se)$logCPM <- cpm(dge, log=TRUE)
+assays(se)$logCPM[1:5, 1:5]
+```
+
+Let's explore now some of the phenotypic variables. Based on the metadata that is provided, we know what information  is stored in each variable. After some visual inspection, we can see that the variables `characteristics_ch1`, `characteristics_ch1.1`, `characteristics_ch1.2`,`characteristics_ch1.3` contain the information about stimulation, treatment, time, and cell line, respectively. These variables represent the relevant experimental conditions
+
+```{r}
+table(se$characteristics_ch1) #stimulation
+table(se$characteristics_ch1.1) #treatment
+table(se$characteristics_ch1.2) #time
+table(se$characteristics_ch1.3) #cell line
+```
+
+To facilitate the handling of these variables we are going to recode them as follows:
+
+```{r}
+se$stimulation <- se$characteristics_ch1
+se$treatment <- se$characteristics_ch1.1
+se$time <- se$characteristics_ch1.2
+se$cell_line <- se$characteristics_ch1.3
+```
+
+We can also identify some variables associated with technical factors, such as the sample preparation protocol in `extract_protocol_ch1`.
+
+```{r}
+table(se$extract_protocol_ch1)
+```
+
+We can see that all samples were prepared using the same protocol. Because of there, there is unlikely to be any sort of variation in the data due to technical protocols.
+
+Finally, we also observe that the variable `description` contains some relevant information about an apparent sub-grouping of the samples. 
+
+```{r}
+se$description
+```
+ 
+We can see that there are biological replicates for each of the samples. Later on the analysis, we will determine whether these biological replicates may contribute to confounding batch effects. 
+
+In Table \@ref(tab:pheno) below, we show a list of all samples and their corresponding experimental conditions in order to gain as much of an understaning as possible about the underlying experimental design.
+
+```{r pheno, echo=FALSE}
+tmpdf <- data.frame("Identifer"=colnames(se),
+                    "Cell line"=se$cell_line,
+                    "Time"=se$time,
+                    "Stimulation" =se$stimulation,
+                    "Treatment" =se$treatment,
+                    Replicate=se$description,
+                    check.names=FALSE)
+kable(tmpdf, caption="Phenotypic variables.")
+```
+
+At this point, the experimental protocol can be easily understood for the data. There are seven different treatment levels (BIO032202, BIO0702697, BIO0919278, DMSO, NTsiRNA, siRNAs523626, siRNAs523629), two different stimulation levels (Unstim, TWEAK), and two different time periods for stimulation and treatment (24hr, 4hr). The cell line is consistent for all samples (U2OS). There is a biological replicate (but no technical replicates) for each sample as well. 
+ 
+We can generate subgrouping varibales for each of the experimental conditions with multiple levels (treatment, stimulation, time, replicate). This is done as follows:
+
+```{r}
+se$samplegrouptreatment <- factor(sapply(strsplit(as.character(se$treatment),
+                                         "-"), function(x) x[1]))
+table(se$samplegrouptreatment)
+
+se$samplegroupdescription <- factor(sapply(strsplit(as.character(se$description),
+                                         "-"), function(x) x[1]))
+table(se$samplegroupdescription)
+
+se$samplegrouptime <- factor(sapply(strsplit(as.character(se$time),
+                                         "-"), function(x) x[1]))
+table(se$samplegrouptime)
+
+se$samplegroupstim <- factor(sapply(strsplit(as.character(se$stimulation),
+                                         "-"), function(x) x[1]))
+table(se$samplegroupstim)
+
+se$samplegroupcell <- factor(sapply(strsplit(as.character(se$cell_line),
+                                         "-"), function(x) x[1]))
+table(se$samplegroupcell)
+
+```
+
+## Sequencing Depth
+
+Let's examine the sequencing depth in terms of total number of sequence read counts mapped to the genome per sample. Figure \@ref(fig:libsizes1) below shows the sequencing depth per sample, also known as library sizes, in increasing order with respect to replicate groups. Figure \@ref(fig:libsizes2) is with respect to treatment group, Figure \@ref(fig:libsizes3) with respect to time, and Figure \@ref(fig:libsizes4) with respect to presence of stimulation. This will be done with respect to every subgroup created above in order to gain as much information as possible about the variation in the data.
+
+<!---
+you can control the height and width in pixels of the figure with
+'out.height' and 'out.width'. Figures are automatically numbered,
+to refer to them in the main text you should use the notation shown
+above as \@ref(fig:xxxx) with xxxx being the label in the code chunk
+that also gives the filename of the figure. This name must be unique
+--->
+
+```{r libsizes1, echo=FALSE, height=8, width=8, out.width="600px", fig.cap="Library sizes in increasing order (replicate group)."}
+
+par(mfrow=c(2,2))
+ord <- order(dge$sample$lib.size/1e6)
+ordmreads <- dge$sample$lib.size[ord]/1e6
+names(ordmreads) <- colnames(se)[ord]
+
+
+bp <- barplot(ordmreads, las=1, ylab="Millions of reads",
+              xlab="", col=as.integer(se$samplegroupdescription[ord]), las=2)
+legend("topleft", c(levels(se$samplegroupdescription)), inset=0.05,
+       pch=c(rep(15, nlevels(se$samplegroupdescription))), ## 77 is ASCII for M
+       col=c(seq_len(nlevels(se$samplegroupdescription)), "black"))
+
+```
+
+```{r libsizes2, echo=FALSE, height=8, width=8, out.width="600px", fig.cap="Library sizes in increasing order (treatment)."}
+
+bp2 <- barplot(ordmreads, las=1, ylab="Millions of reads",
+              xlab="", col=as.integer(se$samplegrouptreatment[ord]), las=2)
+legend("bottomright", c(levels(se$samplegrouptreatment)), inset=0.05,
+       pch=c(rep(15, nlevels(se$samplegrouptreatment))), ## 77 is ASCII for M
+       col=c(seq_len(nlevels(se$samplegrouptreatment)), "black"))
+
+```
+
+```{r libsizes3, echo=FALSE, height=8, width=8, out.width="600px", fig.cap="Library sizes in increasing order (time)."}
+bp3 <- barplot(ordmreads, las=1, ylab="Millions of reads",
+              xlab="", col=as.integer(se$samplegrouptime[ord]), las=2)
+legend("topleft", c(levels(se$samplegrouptime)), inset=0.05,
+       pch=c(rep(15, nlevels(se$samplegrouptime))), ## 77 is ASCII for M
+       col=c(seq_len(nlevels(se$samplegrouptime)), "black"))
+
+```
+
+```{r libsizes4, echo=FALSE, height=8, width=8, out.width="600px", fig.cap="Library sizes in increasing order (stimulation)."}
+
+bp4 <- barplot(ordmreads, las=1, ylab="Millions of reads",
+              xlab="", col=as.integer(se$samplegroupstim[ord]), las=2)
+
+legend("topleft", c(levels(se$samplegroupstim)), inset=0.05,
+       pch=c(rep(15, nlevels(se$samplegroupstim))), ## 77 is ASCII for M
+       col=c(seq_len(nlevels(se$samplegroupstim)), "black"))
+
+
+```
+
+We see fairly substantial differences in sequencing depth, ranging from 5.89 to 12.13 million reads. It appears that the experimental condition groups, for the most part, are not very related to sequencing depth. There may be one exception - it seems that the samples treated with BIO0919278 were sequenced at a lower depth compared to the other treatments. All of the BIO0919278 samples were sequenced at a depth lower than 8.5 million reads, and the histogram shows that these samples are heavily concentrated to the left. 
+
+## Distribution of Expression Levels Among Samples
+
+Figure \@ref(fig:distRawExp) below shows the distribution of expression values per sample in logarithmic CPM units of expression.
+
+```{r distRawExp, echo=FALSE, fig.height=5, fig.width=5, out.width="600px", fig.cap="Non-parametric density distribution of expression profiles per sample.", message=FALSE}
+library(geneplotter)
+par(mar=c(4, 5, 1, 1))
+lst <- as.list(as.data.frame(assays(se)$logCPM))
+multidensity(lst, xlab="log 2 CPM", legend=NULL,
+             main="", las=1)
+
+```
+
+Figure \@ref(fig:boxRawExp) below shows the distribution of expression values per sample in logarithmic CPM units of expression.
+
+``` {r boxRawExp, echo=FALSE, fig.height=5, fig.width=5, out.width="600px", fig.cap="Non-parametric boxplot of expression profiles per sample.", message=FALSE}
+
+boxplot(assays(se)$logCPM, col="gray", xlab="Samples", ylab=expression(log[2] * "CPM"),
+        cex.axis=1.2, cex.lab=1.5, las=1)
+
+```
+
+The multidensity plot and boxplot reveal that there are not substantial differences between the samples in the distribution of expression values.
+
+## Distribution of Expression Levels Among Genes
+
+Let's calculate now the average expression per gene through all the samples. 
+
+``` {r}
+avgexp <- rowMeans(assays(se)$logCPM)
+```
+
+Figure \@ref(fig:exprdist) shows the distribution of those values across genes.
+
+```{r exprdist, echo=FALSE, out.width="600px", fig.cap="Distribution of average expression level per gene."}
+hist(avgexp, xlab="log2 CPM", main="", las=1)
+```
+
+As expected, we have two modes, one for genes that are lowly expressed in nearly all samples and another for genes with some detectable levels of expression across a number of samples. 
+
+## Filtering of Lowly-Expressed Genes
+
+We filter lowly-expressed genes using the function `filterByExpr()`, grouping by sample-group to define the minimum number of samples in which a gene should be expressed. I will choose to use the sample group organized by replicates (`samplegroupdescription`) since it will eliminate genes that were consistently lowly expressed. 
+
+```{r}
+mask <- filterByExpr(dge, group=se$samplegroupdescription)
+se.filt <- se[mask, ]
+dim(se.filt)
+dge.filt <- dge[mask, ]
+dim(dge.filt)
+```
+
+We are left with 13228 genes.
+
+## Normalization
+
+We will now calculate the normalization factors on the filtered expression data set.
+
+```{r}
+dge.filt <- calcNormFactors(dge.filt)
+```
+
+The following code replaces the raw log2 CPM units in the corresponding assay element of the `SummarizedExperiment` object by the normalized ones.
+
+```{r}
+assays(se.filt)$logCPM <- cpm(dge.filt, log=TRUE,
+                              normalized.lib.sizes=TRUE)
+```
+
+## MA-Plots
+
+We examine now the MA-plots of the normalized expression profiles in Figure \@ref(fig:maPlots).
+
+```{r maPlots, echo=FALSE, fig.height=18, fig.width=10, dpi=100, echo=FALSE, fig.cap="MA-plots of filtered and normalized expression values."}
+par(mfrow=c(7, 7), mar=c(4, 5, 3, 1))
+for (i in 1:ncol(se.filt)) {
+  A <- rowMeans(assays(se.filt)$logCPM)
+  M <- assays(se.filt)$logCPM[, i] - A
+  smoothScatter(A, M, main=colnames(se.filt)[i], las=1)
+  abline(h=0, col="blue", lwd=2)
+  lo <- lowess(M ~ A)
+  lines(lo$x, lo$y, col="red", lwd=2)
+}
+```
+These MA plots plot one sample at a time against the average of the rest of the samples. It should be generally expected that the ratio between M (log ratio) and A (mean) average should be close to 1 since we assume only a small fraction of the genes will be differentially expressed between samples. After viewing the MA plots for each sample, we can see that there may exist intensity dependent bias for many of the samples. First of all, we should keep an eye on samples with these biases in case they also display other unexpected features, because then we might consider removing them. However, we already utilized a between sample normalization technique (TMM). The reason for this was to compensate for any systematic technical effects so that we could attribute the observed differences between the samples to a biological signal. Since the data was already normalized, perhaps the observed differences are due to a biological signal. This is a plausible explanation since this experiment includes so many different experimental conditions (treatment, stimulation, time) and it is likely that these conditions would induce signficant changes in gene expression levels. Regardless, we should continue to be aware of potential biases.
+
+## Experimental Design and Batch Identification
+
+We have alerady described the experimental design above. All combinations of cell line, treatment, stimulation, and stimulation time have been sequenced. However, not every biological replicate for each unique combination was sequenced. For this reason, we can anticipate that it won't be possible to identify expression changes associated with the replicate sample group. Additionally, though the experimental protocol was the same for the replicates, it is possible that there exist batch effects related to the replicates that we will be unable to discern. This means that all differences between replicate A and replicate B samples may not just be due to biological differences but also logistical (time of sequencing, etc.).  
+
+We examine now how samples group together by hierarchical clustering and multidimensional scaling, annotating sample group and treatment. We calculate again log CPM values with a high prior count(3) to moderate extreme fold-changes produced by low counts. Visualizing the clustering of samples separated by replicate group as well as experimental conditions should help us to estimate potential batch effects. The same procedure (shown below) is followed for each sample group:
+
+``` {r}
+
+logCPM <- cpm(dge.filt, log=TRUE, prior.count=3)
+d <- as.dist(1-cor(logCPM, method="spearman"))
+sampleClustering <- hclust(d)
+batch <- as.integer(se.filt$samplegrouptreatment)
+sampleDendrogram <- as.dendrogram(sampleClustering, hang=0.1)
+names(batch) <- colnames(se.filt)
+outcome <- paste(se.filt$treatment, colnames(se), sep="\n")
+names(outcome) <- colnames(se.filt)
+sampleDendrogram <- dendrapply(sampleDendrogram,
+                               function(x, batch, labels) {
+                                 if (is.leaf(x)) {
+                                   attr(x, "nodePar") <- list(lab.col=as.vector(batch[attr(x, "label")]))
+                                   attr(x, "label") <- as.vector(labels[attr(x, "label")])
+                                 }
+                                 x
+                               }, batch, outcome)
+```
+
+The resulting dendrograms for each sample group are shown below. Figure \@ref(fig:sampleClustering1) is with respect to treatment. Figure \@ref(fig:sampleClustering2) is with respect to time. Figure \@ref(fig:sampleClustering3) is with respect to stimulation. Figure \@ref(fig:sampleClustering4) is with respect to replication.
+
+```{r sampleClustering1, fig.height=5, fig.width=8, dpi=100, echo=FALSE, fig.cap="Hierarchical clustering of the samples (treatment)."}
+plot(sampleDendrogram, main="Hierarchical clustering of samples (treatment)",
+     cex=0.7)
+legend("topright", levels(se.filt$samplegrouptreatment),
+       fill=seq_len(nlevels(se.filt$samplegrouptreatment)))
+
+```
+
+``` {r, echo=FALSE}
+logCPM <- cpm(dge.filt, log=TRUE, prior.count=3)
+d <- as.dist(1-cor(logCPM, method="spearman"))
+sampleClustering <- hclust(d)
+batch <- as.integer(se.filt$samplegrouptime)
+sampleDendrogram <- as.dendrogram(sampleClustering, hang=0.1)
+names(batch) <- colnames(se.filt)
+outcome <- paste(se.filt$time, colnames(se), sep="\n")
+names(outcome) <- colnames(se.filt)
+sampleDendrogram <- dendrapply(sampleDendrogram,
+                               function(x, batch, labels) {
+                                 if (is.leaf(x)) {
+                                   attr(x, "nodePar") <- list(lab.col=as.vector(batch[attr(x, "label")]))
+                                   attr(x, "label") <- as.vector(labels[attr(x, "label")])
+                                 }
+                                 x
+                               }, batch, outcome)
+```
+
+
+```{r sampleClustering2, echo=FALSE, fig.height=5, fig.width=8, dpi=100, echo=FALSE, fig.cap="Hierarchical clustering of the samples (time)."}
+plot(sampleDendrogram, main="Hierarchical clustering of samples (time)",
+     cex=0.7)
+legend("topright", levels(se.filt$samplegrouptime),
+       fill=seq_len(nlevels(se.filt$samplegrouptime)))
+
+```
+
+``` {r, echo=FALSE}
+
+logCPM <- cpm(dge.filt, log=TRUE, prior.count=3)
+d <- as.dist(1-cor(logCPM, method="spearman"))
+sampleClustering <- hclust(d)
+batch <- as.integer(se.filt$samplegroupstim)
+sampleDendrogram <- as.dendrogram(sampleClustering, hang=0.1)
+names(batch) <- colnames(se.filt)
+outcome <- paste(se.filt$time, colnames(se), sep="\n")
+names(outcome) <- colnames(se.filt)
+sampleDendrogram <- dendrapply(sampleDendrogram,
+                               function(x, batch, labels) {
+                                 if (is.leaf(x)) {
+                                   attr(x, "nodePar") <- list(lab.col=as.vector(batch[attr(x, "label")]))
+                                   attr(x, "label") <- as.vector(labels[attr(x, "label")])
+                                 }
+                                 x
+                               }, batch, outcome)
+```
+
+
+```{r sampleClustering3, fig.height=5, fig.width=8, dpi=100, echo=FALSE, fig.cap="Hierarchical clustering of the samples (stimulation) ."}
+plot(sampleDendrogram, main="Hierarchical clustering of samples (stimulation)",
+     cex=0.7)
+legend("topright", levels(se.filt$samplegroupstim),
+       fill=seq_len(nlevels(se.filt$samplegroupstim)))
+```
+
+```{r, echo=FALSE}
+
+logCPM <- cpm(dge.filt, log=TRUE, prior.count=3)
+d <- as.dist(1-cor(logCPM, method="spearman"))
+sampleClustering <- hclust(d)
+batch <- as.integer(se.filt$samplegroupdescription)
+sampleDendrogram <- as.dendrogram(sampleClustering, hang=0.1)
+names(batch) <- colnames(se.filt)
+outcome <- paste(se.filt$time, colnames(se), sep="\n")
+names(outcome) <- colnames(se.filt)
+sampleDendrogram <- dendrapply(sampleDendrogram,
+                               function(x, batch, labels) {
+                                 if (is.leaf(x)) {
+                                   attr(x, "nodePar") <- list(lab.col=as.vector(batch[attr(x, "label")]))
+                                   attr(x, "label") <- as.vector(labels[attr(x, "label")])
+                                 }
+                                 x
+                               }, batch, outcome)
+```
+
+```{r sampleClustering4, fig.height=5, fig.width=8, dpi=100, echo=FALSE, fig.cap="Hierarchical clustering of the samples (replication group)."}
+plot(sampleDendrogram, main="Hierarchical clustering of samples (replication group)",
+     cex=0.7)
+legend("topright", levels(se.filt$samplegroupdescription),
+       fill=seq_len(nlevels(se.filt$samplegroupdescription)))
+```
+
+As expected, the samples for each of the different treatments tend to cluster separately from eachother. Additionally, it seems that samples for the two different stimulation/treatment times also cluster together. Therefore, it is a reasonable possibility that treatment and stimulation/treatment time seem to drive the largest portion of the variablity in the whole dataset. There is not much clustering for samples with respect to replicates or stimulation. However, since we know that the stimulant (TWEAK) activates noncanonical NF-kB signaling, we will continue to take into account the potential effects of stimulation on differential gene expression. Overall, these results may imply that there is not a strong batch effect related to replicates, as was previously hypothesized. In Figure \@ref(fig:mdsPlot) we show the corresponding MDS plot related to treatment and Figure \@ref(fig:mdsPlot2) related to stimulation time, since those variables were the ones that showed the most significant clustering.
+
+```{r mdsPlot, fig.height=5, fig.width=8, dpi=100, echo=FALSE, fig.cap="Multidimensional scaling plot of the samples (treatment)"}
+
+plotMDS(dge.filt, col=c("red", "orange","brown","green", "blue", "purple", "black")[as.integer(se.filt$samplegrouptreatment)], cex=0.7)
+legend("topright", levels(se.filt$samplegrouptreatment), fill=c("red", "orange","brown","green", "blue", "purple", "black"), inset=0.05, cex=0.7)       
+
+```
+
+```{r mdsPlot2, fig.height=5, fig.width=8, dpi=100, echo=FALSE, fig.cap="Multidimensional scaling plot of the samples (time)"}
+
+plotMDS(dge.filt, col=c("red", "black")[as.integer(se.filt$samplegrouptime)], cex=0.7)
+legend("topright", levels(se.filt$samplegrouptime), fill=c("red", "black"), inset=0.05, cex=0.7)
+
+```
+
+The MDS plot for tereatment shows clear differences between BIO0919278 treatments and all other treatments. It also reinforces the fact that there is clear clustering of samples by treatment. The MDS plot for stimulation time is a bit less clear. There is a clear difference for some of the treatments that were stimulated for 24 hrs, however, this is not consistent and there is not a strong clustering pattern with respect to stimulation time. It is a more reasonable explanation that the clustering seen from stimulation time can more accurately be attributed to treatment. For this reason, in this dataset it makes sense to compare different treatment conditions. Specifically, we are most interested in discerning the difference in gene expression between the two enantiomer treatments (BIO0919278 and BIO0702697). The MDS plot with respect to treatment indicates that we should expect differential gene expression between the two enantiomers. 
+
+# Differential Expression
+
+## Preliminary Analysis (F Test) 
+
+We will first perform a simple assessment of the extent of expression changes and their associated p-values using the F-test implemented in the R/Bioconductor package [sva](http://bioconductor.org/packages/sva). We compare treatment with BIO0919278 and its enantiomer BIO0702697. We first subset the data as follows:
+
+```{r}
+se.filt.enants <- se.filt[, se.filt$treatment == "treatment: BIO0919278" | se.filt$treatment == "treatment: BIO0702697"]
+se.filt.enants$treatment <- droplevels(se.filt.enants$treatment)
+length(rownames(colData(se.filt.enants)))
+se.filt.enants$treatment
+```
+
+In the second step above, we dropped the unused levels from the treatment factor variable. This is important to avoid using samples with treatments that do not exist in this subset of the data. We can see that this new dataset includes 12 samples, and looking at the treatment data we can see that 7 were treated with BIO0919278 and 5 were treated with BIO0702697.We can now build the corresponding full and null model matrices. Based on the results from the MDS plot earlier in the analysis, I have decided not to adjust for known covariates. The plots did not show any clear clustering patterns based on stimulation or time, and so I am opting to build my matricess with the unknown covariate methodology as follows:
+
+```{r}
+mod <- model.matrix(~ se.filt.enants$treatment,
+                    colData(se.filt.enants))
+mod0 <- model.matrix(~ 1, colData(se.filt.enants))
+```
+
+Finally, we conduct the F-test implemented in the package `sva` and examine the amount of differential expression between treatment with BIO0919278 and its enantiomer BIO0702697. I have set the p values as 0.01 and 0.05 in order to reduce the number of DEGs reported since there are quite a high number. 
+
+```{r, message=FALSE}
+library(sva)
+
+pv <- f.pvalue(assays(se.filt.enants)$logCPM, mod, mod0)
+sum(p.adjust(pv, method="fdr") < 0.01)
+sum(p.adjust(pv, method="fdr") < 0.05)
+```
+
+We obtain 4080 differentially expressed genesn (DEGs) at FDR < 1% and 6386 at FDR < 5%. In Figure \@ref(fig:pdistenants) below we can see the distribution of the resulting p-values.
+
+```{r pdistenants, echo=FALSE, out.width="600px", fig.cap="Distribution of raw p-values for an F-test on every gene between treatment with BIO0919278 vs BIO0702697."}
+hist(pv, main="", las=1)
+```
+
+The p-values are quite uniform, though there is some slight enrichment at lower p-values. This may indicate some potential confounding factors that are influencing the results. We build a table with the subset of DEGs with FDR < 5% and show the top-10 genes with lowest p-value in Table \@ref(tab:DEgenesEnants) below.
+
+This was a very basic preliminary differential expression analysis. The analysis that we have conducted so far is "muddy" in the sense that it has failed to separate the samples by the presence of stimulation or other experimental conditions. In a biological sense, the presence or absence of stimulation should theoretically significantly affect the genes that are considered differentially expressed. The next step in the differential expression analysis will aim to more strongly account for confounding experimental conditions so that we can elucidate the true DEGs related to enantiomer treatment. 
+
+## Limited Replication Analysis
+
+The next step in the differential expression analysis is to try to elucidate the DEGs that are relevant to the enantiomer treatments, while controlling for other experimental conditions (stimulation, time). Initially, we attempted to separate the samples into multiple comparison groups by both stimulation and time. However, it was found that this dramatically reduced the number of samples in comparison groups, with some groups having only one sample. This method signficantly reduced the statistical power, and we were not confident in the list of DEGs that we received. Instead, the analyses are separated by stimulation (TWEAK vs no stimulation) so that we can eliminate the effects of stimulationn conditions when searching for DEGs between the enantiomer treatments. Thinking biologically, we decided it was more important to separate groups based on the presence of stimulation rather than time, since the TWEAK stimulant directly effects the non-canonical signaling pathway of interest. Two different comparison groups are created (`dgeenantstim` and `dgeenantnostim`) for subsequent DGE analyses. 
+
+Further, since the number of samples in each comparison group is rather small (between 5 and 7), we need to utilize limited replication technique. The following procedure is applied:
+
+```{r}
+
+# Subsetting data
+
+levels(se.filt.enants$stimulation) <- sub("stimulation: TWEAK", "TWEAK", levels(se.filt.enants$stimulation))
+levels(se.filt.enants$stimulation) <- sub("stimulation: UnStim", "UnStim", levels(se.filt.enants$stimulation))
+levels(se.filt.enants$treatment) <- sub("treatment: BIO0919278", "BIO0919278", levels(se.filt.enants$treatment))
+levels(se.filt.enants$treatment) <- sub("treatment: BIO0702697", "BIO0702697", levels(se.filt.enants$treatment))
+se.filt.enants.tweak <- se.filt.enants[, se.filt.enants$stimulation == "TWEAK"]
+se.filt.enants.nostim <- se.filt.enants[, se.filt.enants$stimulation == "UnStim"]
+se.filt.enants.nostim$treatment <- droplevels(se.filt.enants.nostim$treatment)
+se.filt.enants.tweak$treatment <- droplevels(se.filt.enants.tweak$treatment)
+se.filt.enants.tweak$treatment
+se.filt.enants.nostim$treatment
+
+# Subsetting DGEList
+
+dgeenantstim <- DGEList(counts=assays(se.filt.enants.tweak)$counts, genes=data.frame(Symbol=mcols(se.filt.enants.tweak)$symbol))
+dgeenantstim <- calcNormFactors(dgeenantstim)
+dgeenantnostim <- DGEList(counts=assays(se.filt.enants.nostim)$counts, genes=data.frame(Symbol=mcols(se.filt.enants.nostim)$symbol))
+dgeenantnostim <- calcNormFactors(dgeenantnostim)
+
+#Comparison of Enantiomer Treatments (TWEAK, no covariates)
+
+mod2 <- model.matrix(~ se.filt.enants.tweak$treatment, colData(se.filt.enants.tweak))
+dgeenantstim <- estimateDisp(dgeenantstim, mod2)
+fit2 <- glmQLFit(dgeenantstim, mod2)
+qlf2 <- glmQLFTest(fit2, coef=2)
+tt2 <- topTags(qlf2, n=Inf)
+mod2
+
+#Comparison of Enantiomer Treatments (UnStim, no covariates)
+
+mod3 <- model.matrix(~ se.filt.enants.nostim$treatment, colData(se.filt.enants.nostim))
+dgeenantnostim <- estimateDisp(dgeenantnostim, mod3)
+fit3 <- glmQLFit(dgeenantnostim, mod3)
+qlf3 <- glmQLFTest(fit3, coef=2)
+tt3 <- topTags(qlf3, n=Inf)
+
+# Surrogate Variable Testing 
+
+mod01 <- model.matrix(~ 1, colData(se.filt.enants.tweak))
+sv1 <- sva(assays(se.filt.enants.tweak)$logCPM, mod=mod2, mod0=mod01)
+sv1$n
+
+mod02 <- model.matrix(~ 1, colData(se.filt.enants.nostim))
+sv2 <- sva(assays(se.filt.enants.nostim)$logCPM, mod=mod3, mod0=mod02)
+sv2$n
+
+#Comparison of Enantiomer Treatments (TWEAK, unknown covariates)
+
+mod5 <- model.matrix(~ se.filt.enants.tweak$treatment, colData(se.filt.enants.tweak))
+dgeenantstim <- estimateDisp(dgeenantstim, mod5)
+fit5 <- glmQLFit(dgeenantstim, mod5)
+qlf5 <- glmQLFTest(fit5, coef=2)
+tt5 <- topTags(qlf5, n=Inf)
+
+#Comparison of Enantiomer Treatments (UnStim, unknown covariates)
+
+mod4 <- model.matrix(~ se.filt.enants.nostim$treatment, colData(se.filt.enants.nostim))
+dgeenantnostim <- estimateDisp(dgeenantnostim, mod4)
+fit4 <- glmQLFit(dgeenantnostim, mod4)
+qlf4 <- glmQLFTest(fit4, coef=2)
+tt4 <- topTags(qlf4, n=Inf)
+```
+
+We can see that the tweak comparison group includes 7 samples with 4 treated with BIO919278 and 3 treated with BIO0702697. The nostim comparison group includes 5 samples, 3 of which were treated with BIO919278 and 2 treated with BIO0702697. This analysis was conducted both with no covariates and unknown covariates. We attempted to adjust for known covariates (time), but there was an error that the design matrix was not of full rank. This is due to the fact that we are using a limited replication analysis and we simply do not have enough data points. There was only one surrogate variable presented from the surrogate variable testing, which led us to believe that adjusting for unknown covariates would not be as beneficial.
+
+Below we see a preview of the most signicant DEGs found using the limited replication differential expression analysis with respect to TWEAK stimulation. The previews are presented in the same order as the code below. Additionally, we arw saving the DEGs with FDR < 0.01.
+
+``` {r}
+# Differential Expression Table (TWEAK)
+
+head(tt2,10)
+sum(tt2$table$FDR < 0.01)
+sum(tt2$table$FDR < 0.05)
+tweakDEG <- head(tt2, 571)
+
+#Differential Expression Table (UnStim)
+
+head(tt3, 10)
+sum(tt3$table$FDR < 0.05)
+sum(tt3$table$FDR < 0.1)
+
+#Differential Expression Table (TWEAK, unknown cov)
+
+head(tt5,10)
+sum(tt5$table$FDR < 0.01)
+sum(tt5$table$FDR < 0.05)
+
+#Differential Expression Table (UnStim, unknown cov)
+
+head(tt4,10)
+sum(tt4$table$FDR < 0.05)
+sum(tt4$table$FDR < 0.10)
+
+```
+
+We obtain 571 differentially expressed genes (DEGs) at FDR < 1% and 3571 at FDR < 5% with TWEAK stimulation. In Figure \@ref(fig:LRE1) below we can see the distribution of the resulting p-values.
+
+We obtain 0 differentially expressed genes (DEGs) at FDR < 5% and 2190 at FDR < 10% with no stimulation. In Figure \@ref(fig:LRE2) below we can see the distribution of the resulting p-values.
+
+We receive the exact same results using unknown covariates. Therefore, the rest of the analysis will only include the results from the no covariate group. Additionally, since there are 0 DEGs in the unstimulated condition group with FDR < 5%, we will exclude these results from further analysis. Further, it makes biological sense that there are significantly fewer DEGs in the unstimulated condition since only the stimulated conditions are directly affecting the non-canonical signaling pathway of interest. 
+
+Lastly, we have saved the DEGs with FDR < 0.01 to be utilized further in this differential expression analysis pipeline. 
+
+```{r LRE1, echo=FALSE, out.width="600px", fig.cap="Distribution of raw p-values for a limited replication F-test on every gene between treatment with BIO0919278 vs BIO0702697 with TWEAK stimulation."}
+
+hist(tt2$table$PValue, xlab="Raw p-values", las=1, main="")
+```
+
+```{r LRE2, echo=FALSE, out.width="600px", fig.cap="Distribution of raw p-values for a limited replication F-test on every gene between treatment with BIO0919278 vs BIO0702697 with no stimulation."}
+
+hist(tt3$table$PValue, xlab="Raw p-values", las=1, main="")
+
+```
+
+The p-value distributions for both the stimulated and unstimulated conditions look fairly similar. However, it appears that the p-values are slightly more uniformly distributed in the stimulated condition. This distinction provides further evidence for using DEGs from the stimulated comparison group rather than the unstimulated comparison group. 
+
+## Fold Change Analysis
+
+Below, a new data frame is created that includes the fold change values (Log2FC, FC, 1/FC) as well as statistical indicators (p-values, FDR). This data frame will be utilized to generate a diagnostic volcano plot further in the analysis pipeline. A preview of the table is presented below, and the following procedure was followed: 
+
+``` {r}
+
+# Log Fold Analysis and Filtering
+
+ranking2 <- order(abs(tt2[["table"]][["logFC"]]), decreasing=TRUE)
+tab <- data.frame(Gene=rowData(se.filt.enants.tweak)$symbol[ranking2],
+                Log2FC=round(tt2[["table"]][["logFC"]][ranking2], digits=10),
+                FC=round(2^tt2[["table"]][["logFC"]][ranking2], digits=10),
+                "1/FC"=round(2^(-tt2[["table"]][["logFC"]][ranking2]), digits=10),
+                Pvalues=round(tt2[["table"]][["PValue"]][ranking2], digits=10),
+                FDR=round(tt2[["table"]][["FDR"]][ranking2], digits=10),
+                row.names=rownames(tt2),
+                check.names=FALSE)
+head(tab)
+
+```
+
+Figure \@ref(fig:volcano) shows a volcano plot of log fold change values by raw p-values between genes treated with BIO0919278 and genes treated with BIO0702697 in the TWEAK stimulation group.
+
+``` {r volcano, echo=FALSE, out.width="600px", fig.cap="Volcano plot of log fold change values by raw p-values for a limited replication F-test on every gene between treatment with BIO0919278 vs BIO0702697 with TWEAK stimulation."}
+
+#Preparing Volcano Plot 
+
+filtFDRtab <- tab[tab$FDR <= 0.01,]
+filtPValues <- filtFDRtab$Pvalues
+max <- max(filtPValues)
+logmax <- -log10(max)
+
+#Plotting Volcano Plot 
+
+plot(tab$Log2FC, -log10(tab$Pvalues), pch=".", cex=3,
+xlab="Log fold-change", ylab="Raw p-values", las=1)
+abline(h=logmax, col="green", lty=2)
+legend("topright", c("FDR < 0.01"), fill=c("green"), cex = 0.75)
+
+
+```
+
+The volcano plot above includes a horizontal FDR cutoff line of FDR < 0.01. The points above this line represent the 571 significant differentially expressed genes previously discussed above. This plot shows that the majority of these significant DEGs have negative log fold change values. With respect to this set of DEGs, this indicates biologically that treatment with BIO919278 tends produce underexpressed genes relative to treatment with BIO0702697. 
+
+## Table of DEGs 
+
+We will also build a table with the subset of DEGs with FDR < 1% and show the top-10 genes with lowest p-value in Table \@ref(tab:DEGs) below.
+
+```{r, echo=FALSE}
+
+## generate full table in a CSV file and store it in the 'results' directory
+use_directory(file.path("results"))
+fnameCSV <- "DEGlist.csv"
+fpathCSV <- proj_path(file.path("results", fnameCSV))
+write.csv(tweakDEG[["table"]], fpathCSV, row.names=FALSE)
+
+## generate full table in HTML and store it into the 'results' directory
+ktab <- kable(tweakDEG[["table"]], "html", escape=FALSE, row.names=TRUE,
+              caption=sprintf("Differentially expressed genes. Differentially expressed genes between the two enantiomers with FDR < 1%% with TWEAK stimulation (CSV <a href=\"%s\" download>file</a>).",
+                              fnameCSV))
+ktab <- kable_styling(ktab,
+                      bootstrap_options=c("stripped", "hover", "responsive"),
+                      fixed_thead=TRUE)
+fnameHTML <- "DEGlist.html"
+fpathHTML <- proj_path(file.path("results", fnameHTML))
+save_kable(ktab, file=fpathHTML, self_contained=TRUE)
+```
+
+```{r DEGs, echo=FALSE}
+kable(tweakDEG[["table"]][1:10,], "html", escape=FALSE, row.names=TRUE, 
+      caption=sprintf("Differentially expressed genes. Top-10 differentially expressed genes with lowest p-value between the two enantiomers with FDR < 1%% with TWEAK stimulation. To see the full list of DE genes, follow this <a href=\"%s\" target=\"_blank\">link</a> or download this CSV <a href=\"%s\" download>file</a>.",
+                      fnameHTML, fnameCSV))
+```
+
+
+# Functional Enrichment Analysis
+
+## Gene Ontology Analysis
+
+Below, we are preparing the data for the GO analysis by isolating the rownmames from our DEG list. 
+
+``` {r}
+
+DEGrows <- rownames(tweakDEG)
+length(DEGrows)
+
+```
+
+There are 571 genes in the stimulated comparison with FDR < 0.01. 
+
+The goal of this analysis is to elucidate the biological functions associated with these genes. We are specifically interested in viewing DEGs related to the molecular processes examined in the original article (noncanonical NF-kB signaling pathway). The gene universe provided in the GO analysis includes the genes in the `se.filt.enants` data set. The resulting table below provides a preview of the results for the GO analysis. Additionally, we have created an HTML page with the full results of the analysis. The following procedure was followed: 
+
+``` {r, message = FALSE}
+
+library(org.Hs.eg.db)
+allHumanGO <- select(org.Hs.eg.db, columns="GO", key=keys(org.Hs.eg.db, keytype="SYMBOL"), keytype="SYMBOL")
+sort(table(allHumanGO$EVIDENCE), decreasing=TRUE)
+geneUniverse <- rownames(se.filt.enants)
+
+# conditional non-filtered DEG
+library(GOstats)
+params1 <- new("GOHyperGParams", geneIds=DEGrows,    
+              universeGeneIds=geneUniverse,
+              annotation="org.Hs.eg.db", ontology="BP",
+              pvalueCutoff=0.05, testDirection="over")
+conditional(params1) <- TRUE
+hgOverCond <- hyperGTest(params1)
+
+goresults <- summary(hgOverCond)
+goresults <- goresults[goresults$Size >= 3 & goresults$Size <= 500 & goresults$Count >= 3, ]
+goresults <- goresults[order(goresults$OddsRatio, decreasing=TRUE), ]
+
+geneIDs <- geneIdsByCategory(hgOverCond)[goresults$GOBPID]
+geneSYMs <- sapply(geneIDs, function(id) select(org.Hs.eg.db, columns="SYMBOL", key=id, keytype="ENTREZID")$SYMBOL)
+geneSYMs <- sapply(geneSYMs, paste, collapse=", ")
+goresults <- cbind(goresults, Genes=geneSYMs)
+rownames(goresults) <- 1:nrow(goresults)
+
+library(kableExtra)
+
+use_directory(file.path("results"))
+
+## generate full table in HTML and store it into the 'results' directory
+ktab <- kable(goresults, "html", caption="GO results for conditional analysis in TWEAK stimulated group (FDR < 0.01).")
+ktab <- kable_styling(ktab, bootstrap_options=c("stripped", "hover", "responsive"), fixed_thead=TRUE)
+fnameHTML <- "GOresults.html"
+fpathHTML <- proj_path(file.path("results", fnameHTML))
+save_kable(ktab, file=fpathHTML, self_contained=TRUE)
+browseURL("GOresults.html")
+ktabshow <- kable(goresults[1:10,])
+ktabshow <- kable_styling(ktabshow, bootstrap_options=c("stripped", "hover", "responsive"), fixed_thead=TRUE)
+ktabshow
+
+```
+
+# Discussion 
+
+The original article is primarily concerned with the noncanonical NF-kB signaling pathway and ways in which this pathway is molecularly regulated. This pathway plays an important role in a wide range of critical biological functions, including development and homeostatic control of the immune system. The paper identified molecule BIO0919278 as an activator of this pathway via inhibiting CDK12. The primary focus of this analysis was determine gene expression differences between cellular treatment with BIO0919278 and its (S) enantiomer BIO0702697 and uncover biological functions related to those differentially expressed genes. 
+
+The GO results from this analysis seem to provide reasonable evidence that verify some of the results claimed in the original paper.  Since BIO0702697 was shown by the authors to be significantly less potent compared to BIO0919278, it was intended to serve somewhat as a negative control. An initial scan of the GO results reveal many biological pathways directly associated with various forms of cellular development development (regulation of apoptotic process involved in development, cardiac conduction system development, enresultsardial cushion development, notochord development, metanephric mesenchyme development, etc.). These results, though general, should be expected since BIO919278 activates noncanonical NF-kB signaling, which is crucial in various development pathways. Additionally, these GO results represent genes that are overexpressed in BIO0919278 relative to BIO702697. Therefore, the presence of developmental pathways in the results provides support for the idea that BIO0919278 is a much more potent activator of the noncanonical NF-kB signaling pathway relative to its (S) enantiomer. 
+
+On a more specific level, the authors were particularly interested in RNA polymerase (Pol) II–mediated transcription and the role in which BIO0919278 may play in this pathway. It was hypothesized that BIO0919278 targets and inhibits CDK12, which itself has been previously shown to activate RNA polymerase (Pol) II–mediated transcription. The GO results identify the RNA polymerase (Pol) II–mediated transcription pathway as signficant with respect to BIO0919278 with an odds ratio = 3.08. This provides concrete evidence for the role of BIO0919278 in targeting CDK12 and ultimately regulating this pathway. This pathway is especially important since many previous studies have identified CDK12 as an emerging therapeutic target for cancer due to its role in regulating cellular transcription.     
+
+Overall, the functional enrichment results from this analysis serve to verify the results presented in the initial article. There is a growing body of evidence that BIO0919278 ia an inhibitor of CDK12, and as such could potentially be a compound of interest in developing cancer therapeutics. Further research must be conducted in order to more accurately assess cellular changes induced by BIO0919278. Such experiments should include multiple types of analyses (RNASeq transcriptome analysis, chemoproteomics, confocal microscopy, etc.) in order to quantitatively classify the extent of BIO0919278's involvement in the aforementioned biological pathways. 
+
+# Session information
+
+```{r}
+sessionInfo()
+```
+
+# References
